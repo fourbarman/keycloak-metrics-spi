@@ -52,6 +52,12 @@ public class MetricsEventListener implements EventListenerProvider {
             case CODE_TO_TOKEN_ERROR:
                 PrometheusExporter.instance().recordCodeToTokenError(event, realmProvider);
                 break;
+            case CUSTOM_REQUIRED_ACTION:
+                PrometheusExporter.instance().recordCustomRequiredAction(event, realmProvider); //success external request
+                break;
+            case CUSTOM_REQUIRED_ACTION_ERROR:
+                PrometheusExporter.instance().recordCustomRequiredActionError(event, realmProvider); // error external request
+                break;
             default:
                 PrometheusExporter.instance().recordGenericEvent(event, realmProvider);
         }
@@ -66,15 +72,15 @@ public class MetricsEventListener implements EventListenerProvider {
 
     private void logEventDetails(Event event) {
         logger.debugf("Received user event of type %s in realm %s",
-                event.getType().name(),
-                event.getRealmId());
+            event.getType().name(),
+            event.getRealmId());
     }
 
     private void logAdminEventDetails(AdminEvent event) {
         logger.debugf("Received admin event of type %s (%s) in realm %s",
-                event.getOperationType().name(),
-                event.getResourceType().name(),
-                event.getRealmId());
+            event.getOperationType().name(),
+            event.getResourceType().name(),
+            event.getRealmId());
     }
 
     @Override

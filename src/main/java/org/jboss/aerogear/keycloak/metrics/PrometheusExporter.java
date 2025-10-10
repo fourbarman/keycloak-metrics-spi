@@ -65,6 +65,10 @@ public final class PrometheusExporter {
     final Histogram requestDuration;
     final PushGateway PUSH_GATEWAY;
 
+    final Counter externalRequestsTotal;
+    final Counter externalRequestErrors;
+    final Histogram externalRequestDuration;
+
     private PrometheusExporter() {
         // The metrics collector needs to be a singleton because requiring a
         // provider from the KeyCloak session (session#getProvider) will always
@@ -152,6 +156,27 @@ public final class PrometheusExporter {
             .labelNames("realm", "provider", "error", "client_id")
             .register();
 
+        // *** my new metrics init *** //
+        externalRequestsTotal = Counter.build()
+            .name("keycloak_external_requests")
+            .help("Total external calls from Keycloak SPIs")
+            .labelNames("realm", "spi", "op", "outcome", "error_kind")
+            .register();
+
+        externalRequestErrors = Counter.build()
+            .name("keycloak_external_request_errors")
+            .help("Total errors in external calls")
+            .labelNames("realm", "spi", "op", "error_kind")
+            .register();
+
+        externalRequestDuration = Histogram.build()
+            .name("keycloak_external_request_duration")
+            .help("External call duration (milliseconds)")
+            .buckets(50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000)
+            .labelNames("realm", "spi", "op", "outcome", "error_kind")
+            .register();
+        // *** my new metrics *** //
+
         final boolean URI_METRICS_ENABLED = Boolean.parseBoolean(System.getenv("URI_METRICS_ENABLED"));
         if (URI_METRICS_ENABLED){
             responseTotal = Counter.build()
@@ -232,6 +257,51 @@ public final class PrometheusExporter {
         }
 
         return counter.register();
+    }
+
+    /**
+     * Count external requests
+     * 1. External Requests Total counter
+     * 2. External Request Errors counter
+     * 3. External Request Duration histogram
+     * @param event CUSTOM_REQUIRED_ACTION event
+     * @param realmProvider RealmProvider
+     */
+    public void recordCustomRequiredAction(final Event event, RealmProvider realmProvider) {
+        recordExternalCall(parseExternalCall(event, realmProvider), false);
+    }
+
+    public void recordCustomRequiredActionError(final Event event, RealmProvider realmProvider) {
+        recordExternalCall(parseExternalCall(event, realmProvider), true);
+    }
+
+    private ExtCall parseExternalCall(final Event event, final RealmProvider realmProvider) {
+        Map<String,String> eventDetailsMap = event.getDetails() != null ? event.getDetails() : Collections.emptyMap();
+        String realmName = nullToEmpty(getRealmName(event.getRealmId(), realmProvider));
+        String spi = eventDetailsMap.getOrDefault("obs_spi", "unknown");
+        String op = eventDetailsMap.getOrDefault("obs_op", "unknown");
+        String errorKind = eventDetailsMap.getOrDefault("obs_error_kind", "none");
+
+        double durationMs = 0.0;
+        try {
+            durationMs = Double.parseDouble(eventDetailsMap.getOrDefault("obs_duration_ms", "0"));
+        } catch (Exception ignore) {
+            // ignore?
+        }
+
+        return new ExtCall(realmName, spi, op, errorKind, durationMs);
+    }
+
+    private void recordExternalCall(ExtCall extCall, boolean error) {
+        String outcome = error ? "error" : "success";
+
+        externalRequestsTotal.labels(extCall.realm, extCall.spi, extCall.op, outcome, extCall.errorKind).inc();
+        if (error) {
+            externalRequestErrors.labels(extCall.realm, extCall.spi, extCall.op, extCall.errorKind).inc();
+        }
+        externalRequestDuration.labels(extCall.realm, extCall.spi, extCall.op, outcome, extCall.errorKind).observe(extCall.durationMs);
+
+        pushAsync();
     }
 
     /**
@@ -581,5 +651,27 @@ public final class PrometheusExporter {
 
     private String nullToEmpty(String value) {
         return value == null ? "" : value;
+    }
+
+    /**
+     * External call event details class
+     * realm — имя realm’а Keycloak, к которому относится операция
+     * spi — «кто» вызвал внешний сервис. Provider ID
+     * op — «что» делали внутри SPI: логическое имя операции (например, send-code, verify, demo-call)
+     * outcome — исход вызова: success или error
+     * error_kind — укрупнённый тип ошибки/статуса: 2xx/3xx/4xx/5xx, можно добавить timeout, io, exception, bad-response, unknown.
+     * duration_ms - время external call вызова
+     */
+    private static final class ExtCall {
+        final String realm, spi, op, errorKind;
+        final double durationMs;
+
+        ExtCall(String realm, String spi, String op, String errorKind, double durationMs) {
+            this.realm = realm;
+            this.spi = spi;
+            this.op = op;
+            this.errorKind = errorKind;
+            this.durationMs = durationMs;
+        }
     }
 }
