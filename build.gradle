@@ -1,7 +1,5 @@
-import java.text.SimpleDateFormat
-
 plugins {
-    id "net.nemerosa.versioning" version "3.0.0"
+
     id "java"
 }
 
@@ -15,6 +13,7 @@ version '6.0.1-SNAPSHOT'
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
 }
 
 repositories {
@@ -43,24 +42,10 @@ dependencies {
     testImplementation group: 'org.mockito', name: 'mockito-core', version: '5.4.0'
     // required by 'system-stubs-junit4'
     testImplementation group: 'org.mockito', name: 'mockito-inline', version: '5.2.0'
-
-    compileOnly 'org.apache.tomcat:tomcat-servlet-api:9.0.37'
-
 }
 
 jar {
     from {
         configurations.bundleLib.collect { it.isDirectory() ? it : zipTree(it) }
-    }
-    manifest {
-        attributes(
-            'Built-By'       : System.properties['user.name'],
-            'Build-Timestamp': new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ").format(new Date()),
-            'Build-Revision' : versioning.info.commit,
-            'Created-By'     : "Gradle ${gradle.gradleVersion}",
-            'Build-Jdk'      : "${System.properties['java.version']} (${System.properties['java.vendor']} ${System.properties['java.vm.version']})",
-            'Build-OS'       : "${System.properties['os.name']} ${System.properties['os.arch']} ${System.properties['os.version']}",
-            'Version'        : "${gradle.rootProject.version}"
-        )
     }
 }
