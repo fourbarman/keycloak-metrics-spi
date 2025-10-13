@@ -67,6 +67,7 @@ public final class PrometheusExporter {
 
     final Counter externalRequestsTotal;
     final Counter externalRequestErrors;
+    final Counter externalStatusCodeTotal;
     final Histogram externalRequestDuration;
 
     private PrometheusExporter() {
@@ -160,20 +161,26 @@ public final class PrometheusExporter {
         externalRequestsTotal = Counter.build()
             .name("keycloak_external_requests")
             .help("Total external calls from Keycloak SPIs")
-            .labelNames("realm", "spi", "op", "outcome", "error_kind")
+            .labelNames("realm", "spi", "operation", "outcome", "error_kind")
             .register();
 
         externalRequestErrors = Counter.build()
             .name("keycloak_external_request_errors")
             .help("Total errors in external calls")
-            .labelNames("realm", "spi", "op", "error_kind")
+            .labelNames("realm", "spi", "operation", "error_kind")
             .register();
+
+        externalStatusCodeTotal = Counter.build()
+                .name("keycloak_external_request_status_codes")
+                .help("HTTP status code occurrences in external calls")
+                .labelNames("realm", "spi", "operation", "status_code")
+                .register();
 
         externalRequestDuration = Histogram.build()
             .name("keycloak_external_request_duration")
             .help("External call duration (milliseconds)")
             .buckets(50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000)
-            .labelNames("realm", "spi", "op", "outcome", "error_kind")
+            .labelNames("realm", "spi", "operation", "outcome", "error_kind")
             .register();
         // *** my new metrics *** //
 
@@ -278,28 +285,35 @@ public final class PrometheusExporter {
     private ExtCall parseExternalCall(final Event event, final RealmProvider realmProvider) {
         Map<String,String> eventDetailsMap = event.getDetails() != null ? event.getDetails() : Collections.emptyMap();
         String realmName = nullToEmpty(getRealmName(event.getRealmId(), realmProvider));
-        String spi = eventDetailsMap.getOrDefault("obs_spi", "unknown");
-        String op = eventDetailsMap.getOrDefault("obs_op", "unknown");
-        String errorKind = eventDetailsMap.getOrDefault("obs_error_kind", "none");
+        String spi = eventDetailsMap.getOrDefault("spi", "unknown");
+        String op = eventDetailsMap.getOrDefault("operation", "unknown");
+        String errorKind = eventDetailsMap.getOrDefault("error_kind", "none");
+        String statusCode = eventDetailsMap.get("status_code");
 
         double durationMs = 0.0;
         try {
-            durationMs = Double.parseDouble(eventDetailsMap.getOrDefault("obs_duration_ms", "0"));
+            durationMs = Double.parseDouble(eventDetailsMap.getOrDefault("duration_ms", "0"));
         } catch (Exception ignore) {
             // ignore?
         }
 
-        return new ExtCall(realmName, spi, op, errorKind, durationMs);
+        return new ExtCall(realmName, spi, op, errorKind, durationMs, statusCode);
     }
 
     private void recordExternalCall(ExtCall extCall, boolean error) {
         String outcome = error ? "error" : "success";
 
-        externalRequestsTotal.labels(extCall.realm, extCall.spi, extCall.op, outcome, extCall.errorKind).inc();
+        externalRequestsTotal.labels(extCall.realm, extCall.spi, extCall.operation, outcome, extCall.errorKind).inc();
+
         if (error) {
-            externalRequestErrors.labels(extCall.realm, extCall.spi, extCall.op, extCall.errorKind).inc();
+            externalRequestErrors.labels(extCall.realm, extCall.spi, extCall.operation, extCall.errorKind).inc();
         }
-        externalRequestDuration.labels(extCall.realm, extCall.spi, extCall.op, outcome, extCall.errorKind).observe(extCall.durationMs);
+        //histogram counter
+        externalRequestDuration.labels(extCall.realm, extCall.spi, extCall.operation, outcome, extCall.errorKind).observe(extCall.durationMs);
+
+        if (extCall.statusCode != null && !extCall.statusCode.isBlank()) {
+            externalStatusCodeTotal.labels(extCall.realm, extCall.spi, extCall.operation, extCall.statusCode).inc();
+        }
 
         pushAsync();
     }
@@ -657,21 +671,22 @@ public final class PrometheusExporter {
      * External call event details class
      * realm — имя realm’а Keycloak, к которому относится операция
      * spi — «кто» вызвал внешний сервис. Provider ID
-     * op — «что» делали внутри SPI: логическое имя операции (например, send-code, verify, demo-call)
+     * operation — «что» делали внутри SPI: логическое имя операции (например, send-code, verify, demo-call)
      * outcome — исход вызова: success или error
      * error_kind — укрупнённый тип ошибки/статуса: 2xx/3xx/4xx/5xx, можно добавить timeout, io, exception, bad-response, unknown.
      * duration_ms - время external call вызова
      */
     private static final class ExtCall {
-        final String realm, spi, op, errorKind;
+        final String realm, spi, operation, errorKind, statusCode;
         final double durationMs;
 
-        ExtCall(String realm, String spi, String op, String errorKind, double durationMs) {
+        ExtCall(String realm, String spi, String operation, String errorKind, double durationMs, String statusCode) {
             this.realm = realm;
             this.spi = spi;
-            this.op = op;
+            this.operation = operation;
             this.errorKind = errorKind;
             this.durationMs = durationMs;
+            this.statusCode = statusCode;
         }
     }
 }
