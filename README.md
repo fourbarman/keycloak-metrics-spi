@@ -2,6 +2,175 @@
 
 # Keycloak Metrics SPI
 
+---
+### Что делает плагин
+
+Плагин дополняет aerogear-метрики Keycloak и добавляет счётчики/гистограммы для внешних вызовов из SPI:
+
+- keycloak_external_requests_total{realm,spi,operation,outcome,error_kind}
+- keycloak_external_request_errors_total{realm,spi,operation,error_kind}
+- keycloak_external_request_duration_bucket|_count|_sum{realm,spi,operation,outcome,error_kind} — в миллисекундах
+- keycloak_external_request_status_codes_total{realm,spi,operation,status_code}
+
+Где:
+
+- **realm** — имя realm.
+- **spi** — ID провайдера (кто вызывал внешний сервис).
+- **operation** — логическое имя операции (send-code, verify, login, …).
+- **outcome** — success/error (автоматически расставляется: см. ниже).
+- **error_kind** — укрупнённый класс результата: 2xx|3xx|4xx|5xx|timeout|io|exception|bad-response|unknown.
+- **status_code** — опционально конкретный HTTP-код (200, 404, 503, …).
+
+Экспорт идёт на обычную /realms/{realm}/metrics (как в aerogear). PushGateway поддерживается опционально через env.
+
+### 1. Сборка артефакта
+
+В репозитории уже настроен «толстый» JAR через Gradle (без shadow):  
+```./gradlew clean test jar```
+- выходной файл: build/libs/keycloak-metrics-spi-<version>.jar
+- внутрь JAR включены зависимости Prometheus (bundleLib), keycloak-зависимости остаются внешними.
+
+### 2. Включение в нужном realm’е
+
+1. В админ-консоли: **Нужный Realm** → **Realm Settings** → **Events**:
+- включите Save events (по желанию для UI, метрики работают и без сохранения);
+- в Event listeners добавьте listener (его ID, который указан в *ProviderFactory).
+2. При необходимости в остальных реалмах повторите.  
+> Если listener не включён в realm — он не будет получать события юзеров этого realm.
+
+### 3. Как из других провайдеров писать метрики
+
+- Вызывайте внешний сервис как обычно, а затем сгенерируйте пользовательское событие:
+- Для успеха — ```EventType.CUSTOM_REQUIRED_ACTION + b.success()```
+- Для ошибки — ```EventType.CUSTOM_REQUIRED_ACTION_ERROR + b.error("<reason>")```
+- Заполнить поля события  
+Пример:
+```java
+long started = System.currentTimeMillis();
+int status = 0;
+String errorKind = "unknown";
+String outcome = "success";
+
+try {
+    // ваш внешний вызов
+    // ... вернулось 200
+    status = 200;
+    errorKind = "2xx";
+    outcome = "success";
+} catch (SocketTimeoutException e) {
+    outcome = "error";
+    errorKind = "timeout";
+    status = 504; // если уместно
+    // лог/обработка
+} catch (Exception e) {
+    outcome = "error";
+    errorKind = "exception";
+    status = 500;
+} finally {
+    long durationMs = System.currentTimeMillis() - started;
+
+    EventBuilder b = new EventBuilder(realm, session, session.getContext().getConnection())
+        .event(outcome.equals("success") ? EventType.CUSTOM_REQUIRED_ACTION
+                                         : EventType.CUSTOM_REQUIRED_ACTION_ERROR)
+        .detail("spi",          "<your-provider-id>")   // например, "sms-provider"
+        .detail("operation",    "<op-name>")            // "send-code", "verify", …
+        .detail("duration_ms",  String.valueOf(durationMs))
+        .detail("error_kind",   errorKind)              // 2xx/4xx/5xx/timeout/io/exception/…
+        .detail("status_code",  String.valueOf(status));
+
+    if ("success".equals(outcome)) b.success();
+    else b.error("external_call_failed");
+```
+**Важно**  
+- Метку ```outcome``` мы не передаём вручную — она вычисляется на стороне listener’а по типу события (*_ERROR → error, иначе success).
+- Следите за кардинальностью меток. operation держите коротким и фиксированным набором значений.
+
+### 4. Prometheus: как собирать
+**Если у уже есть /realms/{realm}/metrics**  
+Добавьте scrape-джоб в **prometheus.yml** (пример):
+```dockerfile
+scrape_configs:
+  - job_name: 'keycloak'
+    metrics_path: /realms/test/metrics
+    static_configs:
+      - targets: ['keycloak:8080']
+```
+#### (Опционально) PushGateway
+Задайте переменные окружения Keycloak:  
+PROMETHEUS_PUSHGATEWAY_ADDRESS=http://pushgateway:9091
+(опц.) PROMETHEUS_PUSHGATEWAY_JOB=keycloak
+(опц.) PROMETHEUS_PUSHGATEWAY_BASIC_AUTH_USERNAME/PASSWORD
+(опц.) PROMETHEUS_GROUPING_KEY_INSTANCE — либо ENVVALUE:HOSTNAME для подстановки из env.
+
+### 5. Примеры PromQL для Grafana
+
+**QPS по операциям и исходам:**
+```
+sum by (operation, outcome) (
+  rate(keycloak_external_requests_total[5m])
+)
+```
+**Ошибка-рейт по операциям и типу ошибки:**
+```
+sum by (operation, error_kind) (
+  rate(keycloak_external_request_errors_total[5m])
+)
+```
+**95-й перцентиль латентности (мс) по операциям (только success):**
+```
+histogram_quantile(
+  0.95,
+  sum by (operation, le) (
+    rate(keycloak_external_request_duration_bucket{outcome="success"}[5m])
+  )
+)
+```
+**Процент ошибок (Error Rate) по SPI:**
+```
+100 * sum by (spi) (rate(keycloak_external_request_errors_total[5m]))
+  /
+sum by (spi) (rate(keycloak_external_requests_total[5m]))
+```
+**Топ проблемных HTTP-кодов за 15м:**
+```
+topk(5,
+  sum by (operation, status_code) (increase(keycloak_external_request_status_codes_total[15m]))
+)
+```
+### 6. Рекомендации по алертам
+#### Высокий процент ошибок (за 10 минут > 2%):
+```
+(
+  sum by (spi) (rate(keycloak_external_request_errors_total[10m]))
+/
+  sum by (spi) (rate(keycloak_external_requests_total[10m]))
+) > 0.02
+```
+#### SLO по латентности (p95 > 500мс в течение 10м):
+```
+histogram_quantile(
+  0.95,
+  sum by (le, operation) (rate(keycloak_external_request_duration_bucket[10m]))
+) > 500
+```
+#### Шип ошибок 5xx:
+```
+increase(keycloak_external_request_status_codes_total{status_code=~"5.."}[5m]) > 10
+```
+### 6. Производительность и аккуратность
+- Минимизируйте метки: фиксированный словарь spi/operation; избегайте динамических значений (UUID, userId, requestId).
+- Не логируйте секреты в Event.detail.
+- Не бросайте исключения после записи метрики — события и так попадают в слушатель.
+- Duration в миллисекундах — учитывайте это в графиках/алертах.
+
+### 7. Grafana
+В репозитории уже есть пример готового дашборда для Grafana с метриками aerogear + предоставляемые дополнительно.
+
+---
+
+<center>Оригинальный readme от aerogear</center>
+---
+
 A [Service Provider](https://www.keycloak.org/docs/latest/server_development/index.html#_providers) that adds a metrics endpoint to Keycloak. The endpoint returns metrics data ready to be scraped by [Prometheus](https://prometheus.io/).
 
 Two distinct providers are defined:
@@ -26,7 +195,6 @@ $ ./gradlew test
 
 There are two ways to build the project using:
  * [Gradle](https://gradle.org/)
- * [Maven](https://maven.apache.org/)
 
 You can choose between the tools the most convenient for you. Read further how to use each of them.
 
@@ -40,16 +208,6 @@ $ ./gradlew jar
 
 builds the jar and writes it to _build/libs_.
 
-### Maven
-
-To build the jar file using maven run the following command (will bundle the prometheus client libraries as well):
-
-```sh
-mvn package
-```
-
-It will build the project and write jar to the _./target_.
-
 ### Configurable versions for some packages
 
 You can build the project using a different version of Keycloak or Prometheus, running the command:
@@ -57,16 +215,10 @@ You can build the project using a different version of Keycloak or Prometheus, r
 #### For Gradle
 
 ```sh
-$ ./gradlew -PkeycloakVersion="15.0.2.Final" -PprometheusVersion="0.12.0" jar
+$ ./gradlew -PkeycloakVersion="24.0.5" -PprometheusVersion="0.12.0" jar
 ```
 
 or by changing the `gradle.properties` file in the root of the project.
-
-#### For Maven
-
-```sh
-mvn clean package -Dkeycloak.version=15.0.0 -Dprometheus.version=0.9.0
-```
 
 ## Install and setup
 
