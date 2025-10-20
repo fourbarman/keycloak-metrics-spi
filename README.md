@@ -7,19 +7,18 @@
 
 Плагин дополняет aerogear-метрики Keycloak и добавляет счётчики/гистограммы для внешних вызовов из SPI:
 
-- keycloak_external_requests_total{realm,spi,operation,outcome,error_kind}
-- keycloak_external_request_errors_total{realm,spi,operation,error_kind}
-- keycloak_external_request_duration_bucket|_count|_sum{realm,spi,operation,outcome,error_kind} — в миллисекундах
-- keycloak_external_request_status_codes_total{realm,spi,operation,status_code}
+- keycloak_external_requests_total{realm,spi,operation,result,status_family} - общий счётчик внешних вызовов, разрез по результату и «семейству» исхода.
+- keycloak_external_request_duration_bucket|_count|_sum{realm,spi,operation,result,status_family} — в миллисекундах - латентность внешних вызовов с разделением успех/ошибка. Можно строить p95/p99, среднее и т.п.
+- keycloak_external_request_status_codes_total{realm,spi,operation,status_code} - точная разбивка по HTTP-статусам (когда статус есть). Полезно видеть, что именно прилетает: 200/204/500/502 и т.д.
 
 Где:
 
 - **realm** — имя realm.
 - **spi** — ID провайдера (кто вызывал внешний сервис).
 - **operation** — логическое имя операции (send-code, verify, login, …).
-- **outcome** — success/error (автоматически расставляется: см. ниже).
-- **error_kind** — укрупнённый класс результата: 2xx|3xx|4xx|5xx|timeout|io|exception|bad-response|unknown.
-- **status_code** — опционально конкретный HTTP-код (200, 404, 503, …).
+- **result** — success/error (автоматически расставляется: см. ниже).
+- **status_family** — укрупнённый класс результата: 2xx|3xx|4xx|5xx|timeout|io|exception|bad-response|unknown.
+- **status_code** — конкретный HTTP-код (200, 404, 503, …).
 
 Экспорт идёт на обычную /realms/{realm}/metrics (как в aerogear). PushGateway поддерживается опционально через env.
 
@@ -49,40 +48,40 @@
 long started = System.currentTimeMillis();
 int status = 0;
 String errorKind = "unknown";
-String outcome = "success";
+String result = "success";
 
 try {
     // ваш внешний вызов
     // ... вернулось 200
     status = 200;
     errorKind = "2xx";
-    outcome = "success";
+result = "success";
 } catch (SocketTimeoutException e) {
-    outcome = "error";
+result = "error";
     errorKind = "timeout";
     status = 504; // если уместно
     // лог/обработка
 } catch (Exception e) {
-    outcome = "error";
+result = "error";
     errorKind = "exception";
     status = 500;
 } finally {
     long durationMs = System.currentTimeMillis() - started;
 
     EventBuilder b = new EventBuilder(realm, session, session.getContext().getConnection())
-        .event(outcome.equals("success") ? EventType.CUSTOM_REQUIRED_ACTION
+        .event(result.equals("success") ? EventType.CUSTOM_REQUIRED_ACTION
                                          : EventType.CUSTOM_REQUIRED_ACTION_ERROR)
         .detail("spi",          "<your-provider-id>")   // например, "sms-provider"
         .detail("operation",    "<op-name>")            // "send-code", "verify", …
         .detail("duration_ms",  String.valueOf(durationMs))
-        .detail("error_kind",   errorKind)              // 2xx/4xx/5xx/timeout/io/exception/…
+        .detail("status_family",   statusFamily)              // 2xx/4xx/5xx/timeout/io/exception/…
         .detail("status_code",  String.valueOf(status));
 
-    if ("success".equals(outcome)) b.success();
+    if ("success".equals(result)) b.success();
     else b.error("external_call_failed");
 ```
 **Важно**  
-- Метку ```outcome``` мы не передаём вручную — она вычисляется на стороне listener’а по типу события (*_ERROR → error, иначе success).
+- Метку ```result``` мы не передаём вручную — она вычисляется на стороне listener’а по типу события (*_ERROR → error, иначе success).
 - Следите за кардинальностью меток. operation держите коротким и фиксированным набором значений.
 
 ### 4. Prometheus: как собирать
@@ -103,47 +102,121 @@ PROMETHEUS_PUSHGATEWAY_ADDRESS=http://pushgateway:9091
 (опц.) PROMETHEUS_GROUPING_KEY_INSTANCE — либо ENVVALUE:HOSTNAME для подстановки из env.
 
 ### 5. Примеры PromQL для Grafana
+**Для удобства в Grafana заведите переменные: ```$realm```, ```$spi```, ```$operation``` (со значением по умолчанию ```.*```)**
+#### Трафик / RPS
+**Всего и по исходу (success/error)**
+```
+sum by (result) (
+    rate(keycloak_external_requests{realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
+)
+```
+Panel: Time series (Stack/Series), Legend: {{result}}  
+**По семейству статусов (2xx/4xx/5xx/TIMEOUT/IO/UNEXPECTED) среди ошибок**
+```
+sum by (status_family) (
+  rate(keycloak_external_requests{result="error", realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
+)
+```
 
-**QPS по операциям и исходам:**
+**Error rate (%)**
 ```
-sum by (operation, outcome) (
-  rate(keycloak_external_requests_total[5m])
+100 *
+sum(
+  rate(keycloak_external_requests{result="error", realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
 )
-```
-**Ошибка-рейт по операциям и типу ошибки:**
-```
-sum by (operation, error_kind) (
-  rate(keycloak_external_request_errors_total[5m])
+/
+sum(
+  rate(keycloak_external_requests{realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
 )
-```
-**95-й перцентиль латентности (мс) по операциям (только success):**
+```  
+Panel: Stat / Gauge, Unit: Percent (0–100).
+#### Латентность (перцентили)
+**P50 / P95 / P99 — успехи (ms)**
 ```
 histogram_quantile(
-  0.95,
-  sum by (operation, le) (
-    rate(keycloak_external_request_duration_bucket{outcome="success"}[5m])
+  0.50,
+  sum by (le) (
+    rate(keycloak_external_request_duration_bucket{result="success", realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
+  )
+)
+```  
+Аналогично для 0.95 и 0.99.  
+Panel: Time series, Unit: milliseconds.  
+**Средняя длительность (успехи)**
+```
+sum(
+  rate(keycloak_external_request_duration_sum{result="success", realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
+)
+/
+sum(
+  rate(keycloak_external_request_duration_count{result="success", realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
+)
+```
+#### Распределение HTTP-кодов
+**Стек-бар по кодам**
+```
+sum by (status_code) (
+  rate(keycloak_external_request_status_codes{realm=~"$realm", spi=~"$spi", operation=~"$operation"}[5m])
+)
+```  
+Panel: Bar chart (Stacked), Legend: {{status_code}}  
+#### Лидеры по ошибкам / таймаутам
+**Ошибки по операции (top-N)**
+```
+topk(5,
+  sum by (spi, operation) (
+    rate(keycloak_external_requests{result="error", realm=~"$realm", spi=~"$spi"}[5m])
   )
 )
 ```
-**Процент ошибок (Error Rate) по SPI:**
+**Таймауты и I/O-сбои**
 ```
-100 * sum by (spi) (rate(keycloak_external_request_errors_total[5m]))
-  /
-sum by (spi) (rate(keycloak_external_requests_total[5m]))
-```
-**Топ проблемных HTTP-кодов за 15м:**
-```
-topk(5,
-  sum by (operation, status_code) (increase(keycloak_external_request_status_codes_total[15m]))
+sum by (status_family) (
+  rate(keycloak_external_requests{
+    result="error",
+    status_family=~"TIMEOUT|IO",
+    realm=~"$realm", spi=~"$spi", operation=~"$operation"
+  }[5m])
 )
 ```
+#### Успешность (SLI) по операциям
+**Success rate по (spi, operation)**
+```
+100 *
+sum by (spi, operation) (
+  rate(keycloak_external_requests{result="success", realm=~"$realm"}[5m])
+)
+/
+sum by (spi, operation) (
+  rate(keycloak_external_requests{realm=~"$realm"}[5m])
+)
+```
+#### Топ медленных операций (средняя длительность)
+```
+topk(5,
+  (
+    sum by (spi, operation) (
+      rate(keycloak_external_request_duration_sum{result="success", realm=~"$realm"}[5m])
+    )
+    /
+    sum by (spi, operation) (
+      rate(keycloak_external_request_duration_count{result="success", realm=~"$realm"}[5m])
+    )
+  )
+)
+```
+
 ### 6. Рекомендации по алертам
 #### Высокий процент ошибок (за 10 минут > 2%):
 ```
 (
-  sum by (spi) (rate(keycloak_external_request_errors_total[10m]))
+  sum by (spi) (
+    rate(keycloak_external_requests_total{result="error", realm=~"$realm", operation=~"$operation"}[10m])
+  )
 /
-  sum by (spi) (rate(keycloak_external_requests_total[10m]))
+  sum by (spi) (
+    rate(keycloak_external_requests_total{realm=~"$realm", operation=~"$operation"}[10m])
+  )
 ) > 0.02
 ```
 #### SLO по латентности (p95 > 500мс в течение 10м):
@@ -156,6 +229,13 @@ histogram_quantile(
 #### Шип ошибок 5xx:
 ```
 increase(keycloak_external_request_status_codes_total{status_code=~"5.."}[5m]) > 10
+```
+
+#### Шип таймаутов/IO:
+```
+increase(
+  keycloak_external_requests_total{result="error", status_family=~"TIMEOUT|IO", realm=~"$realm", spi=~"$spi"}[5m]
+) > 3
 ```
 ### 6. Производительность и аккуратность
 - Минимизируйте метки: фиксированный словарь spi/operation; избегайте динамических значений (UUID, userId, requestId).

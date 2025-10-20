@@ -66,7 +66,6 @@ public final class PrometheusExporter {
     final PushGateway PUSH_GATEWAY;
 
     final Counter externalRequestsTotal;
-    final Counter externalRequestErrors;
     final Counter externalStatusCodeTotal;
     final Histogram externalRequestDuration;
 
@@ -159,15 +158,9 @@ public final class PrometheusExporter {
 
         // *** my new metrics init *** //
         externalRequestsTotal = Counter.build()
-            .name("keycloak_external_requests")
+            .name("keycloak_external_requests_total")
             .help("Total external calls from Keycloak SPIs")
-            .labelNames("realm", "spi", "operation", "outcome", "error_kind")
-            .register();
-
-        externalRequestErrors = Counter.build()
-            .name("keycloak_external_request_errors")
-            .help("Total errors in external calls")
-            .labelNames("realm", "spi", "operation", "error_kind")
+            .labelNames("realm", "spi", "operation", "result", "status_family")
             .register();
 
         externalStatusCodeTotal = Counter.build()
@@ -180,7 +173,7 @@ public final class PrometheusExporter {
             .name("keycloak_external_request_duration")
             .help("External call duration (milliseconds)")
             .buckets(50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000)
-            .labelNames("realm", "spi", "operation", "outcome", "error_kind")
+            .labelNames("realm", "spi", "operation", "result", "status_family")
             .register();
         // *** my new metrics *** //
 
@@ -287,7 +280,7 @@ public final class PrometheusExporter {
         String realmName = nullToEmpty(getRealmName(event.getRealmId(), realmProvider));
         String spi = eventDetailsMap.getOrDefault("spi", "unknown");
         String op = eventDetailsMap.getOrDefault("operation", "unknown");
-        String errorKind = eventDetailsMap.getOrDefault("error_kind", "none");
+        String errorKind = eventDetailsMap.getOrDefault("status_family", "none");
         String statusCode = eventDetailsMap.get("status_code");
 
         double durationMs = 0.0;
@@ -301,15 +294,12 @@ public final class PrometheusExporter {
     }
 
     private void recordExternalCall(ExtCall extCall, boolean error) {
-        String outcome = error ? "error" : "success";
+        String result = error ? "error" : "success";
 
-        externalRequestsTotal.labels(extCall.realm, extCall.spi, extCall.operation, outcome, extCall.errorKind).inc();
+        externalRequestsTotal.labels(extCall.realm, extCall.spi, extCall.operation, result, extCall.statusFamily).inc();
 
-        if (error) {
-            externalRequestErrors.labels(extCall.realm, extCall.spi, extCall.operation, extCall.errorKind).inc();
-        }
         //histogram counter
-        externalRequestDuration.labels(extCall.realm, extCall.spi, extCall.operation, outcome, extCall.errorKind).observe(extCall.durationMs);
+        externalRequestDuration.labels(extCall.realm, extCall.spi, extCall.operation, result, extCall.statusFamily).observe(extCall.durationMs);
 
         if (extCall.statusCode != null && !extCall.statusCode.isBlank()) {
             externalStatusCodeTotal.labels(extCall.realm, extCall.spi, extCall.operation, extCall.statusCode).inc();
@@ -677,14 +667,14 @@ public final class PrometheusExporter {
      * duration_ms - время external call вызова
      */
     private static final class ExtCall {
-        final String realm, spi, operation, errorKind, statusCode;
+        final String realm, spi, operation, statusFamily, statusCode;
         final double durationMs;
 
-        ExtCall(String realm, String spi, String operation, String errorKind, double durationMs, String statusCode) {
+        ExtCall(String realm, String spi, String operation, String statusFamily, double durationMs, String statusCode) {
             this.realm = realm;
             this.spi = spi;
             this.operation = operation;
-            this.errorKind = errorKind;
+            this.statusFamily = statusFamily;
             this.durationMs = durationMs;
             this.statusCode = statusCode;
         }
